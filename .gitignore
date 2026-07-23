@@ -4,4 +4,4 @@
 __pycache__/
 *.py[cod]
 exports/
-
+.oura_sync_state.json

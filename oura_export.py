@@ -22,6 +22,8 @@ TOKEN_URL = "https://api.ouraring.com/oauth/token"
 API_BASE_URL = "https://api.ouraring.com/v2/usercollection"
 DEFAULT_REDIRECT_URI = "http://localhost:8000/callback"
 TOKEN_FILE = Path(".oura_tokens.json")
+SYNC_STATE_FILE = Path(".oura_sync_state.json")
+MAX_DATETIME_WINDOW_DAYS = 30
 
 # "date" usa start_date/end_date; "datetime" usa start_datetime/end_datetime.
 # "collection" pagina sin filtro temporal y "single" devuelve un solo documento.
@@ -168,6 +170,39 @@ def load_tokens() -> dict[str, Any]:
             f"No existe {TOKEN_FILE}. Ejecutá primero: python oura_export.py auth"
         )
     return json.loads(TOKEN_FILE.read_text(encoding="utf-8"))
+
+
+def load_sync_state() -> dict[str, Any] | None:
+    if not SYNC_STATE_FILE.exists():
+        return None
+    try:
+        state = json.loads(SYNC_STATE_FILE.read_text(encoding="utf-8"))
+        date.fromisoformat(str(state["last_complete_date"]))
+        return state
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"{SYNC_STATE_FILE} es inválido. Corregilo o eliminá el archivo "
+            "para crear un checkpoint nuevo."
+        ) from exc
+
+
+def save_sync_state(
+    last_complete_date: date,
+    destination: str | None,
+    source: str,
+) -> None:
+    state = {
+        "last_complete_date": last_complete_date.isoformat(),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "last_export": destination,
+        "source": source,
+    }
+    temporary = SYNC_STATE_FILE.with_suffix(".tmp")
+    temporary.write_text(
+        json.dumps(state, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    temporary.replace(SYNC_STATE_FILE)
 
 
 def exchange_code(
@@ -362,6 +397,43 @@ def endpoint_params(kind: str, start: date, end: date) -> dict[str, str]:
     return {}
 
 
+def split_date_range(
+    start: date,
+    end: date,
+    max_days: int,
+) -> list[tuple[date, date]]:
+    if max_days < 1:
+        raise ValueError("max_days debe ser 1 o mayor.")
+    if start > end:
+        raise ValueError("La fecha inicial no puede ser posterior a la final.")
+
+    windows: list[tuple[date, date]] = []
+    cursor = start
+    while cursor <= end:
+        window_end = min(cursor + timedelta(days=max_days - 1), end)
+        windows.append((cursor, window_end))
+        cursor = window_end + timedelta(days=1)
+    return windows
+
+
+def resolve_sync_period(
+    last_complete_date: date | None,
+    completed_end: date,
+    initial_days: int,
+) -> tuple[date, date] | None:
+    if initial_days < 1:
+        raise ValueError("--initial-days debe ser 1 o mayor.")
+
+    if last_complete_date is None:
+        sync_start = completed_end - timedelta(days=initial_days - 1)
+    else:
+        sync_start = last_complete_date + timedelta(days=1)
+
+    if sync_start > completed_end:
+        return None
+    return sync_start, completed_end
+
+
 def get_endpoint(
     endpoint: str,
     kind: str,
@@ -370,7 +442,6 @@ def get_endpoint(
     end: date,
 ) -> Any:
     url = f"{API_BASE_URL}/{endpoint}"
-    base_params = endpoint_params(kind, start, end)
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Accept": "application/json",
@@ -379,22 +450,39 @@ def get_endpoint(
     if kind == "single":
         return request_json("GET", url, headers=headers)
 
+    # Oura limita las consultas basadas en start_datetime/end_datetime a un
+    # máximo de 30 días en algunos endpoints, como ring_battery_level. Dividir
+    # todas las series datetime también mantiene manejables las descargas largas.
+    windows = (
+        split_date_range(start, end, MAX_DATETIME_WINDOW_DAYS)
+        if kind == "datetime"
+        else [(start, end)]
+    )
+
     all_documents: list[Any] = []
-    next_token: str | None = None
-    while True:
-        params = dict(base_params)
-        if next_token:
-            params["next_token"] = next_token
-        payload = request_json("GET", url, headers=headers, params=params)
+    for window_number, (window_start, window_end) in enumerate(windows, start=1):
+        if len(windows) > 1:
+            print(
+                f"    {endpoint}: bloque {window_number}/{len(windows)} "
+                f"({window_start} a {window_end})"
+            )
 
-        documents = payload.get("data", [])
-        if not isinstance(documents, list):
-            raise RuntimeError(f"Respuesta inesperada del endpoint {endpoint}.")
-        all_documents.extend(documents)
+        base_params = endpoint_params(kind, window_start, window_end)
+        next_token: str | None = None
+        while True:
+            params = dict(base_params)
+            if next_token:
+                params["next_token"] = next_token
+            payload = request_json("GET", url, headers=headers, params=params)
 
-        next_token = payload.get("next_token")
-        if not next_token:
-            break
+            documents = payload.get("data", [])
+            if not isinstance(documents, list):
+                raise RuntimeError(f"Respuesta inesperada del endpoint {endpoint}.")
+            all_documents.extend(documents)
+
+            next_token = payload.get("next_token")
+            if not next_token:
+                break
 
     return {"data": all_documents, "next_token": None}
 
@@ -405,7 +493,7 @@ def download(
     end: date | None,
     output_root: Path,
     only: list[str] | None,
-) -> None:
+) -> dict[str, Any]:
     client_id, client_secret, _redirect_uri = require_config()
     access_token = valid_access_token(client_id, client_secret)
     resolved_start, resolved_end = resolve_period(days, start, end)
@@ -484,6 +572,85 @@ def download(
         encoding="utf-8",
     )
     print(f"\nExportación terminada: {destination.resolve()}")
+    return summary
+
+
+def sync(
+    initial_days: int,
+    output_root: Path,
+    initialize_from_existing: bool,
+) -> None:
+    # Solo se sincronizan días cerrados. El día actual se descargará en la
+    # próxima ejecución, cuando sus resúmenes de sueño/actividad estén completos.
+    completed_end = date.today() - timedelta(days=1)
+
+    if initialize_from_existing:
+        existing_state = load_sync_state()
+        if existing_state is not None:
+            raise RuntimeError(
+                f"Ya existe un checkpoint en "
+                f"{existing_state['last_complete_date']}. "
+                "No hace falta volver a inicializarlo."
+            )
+        save_sync_state(
+            last_complete_date=completed_end,
+            destination=None,
+            source="existing_exports",
+        )
+        print(
+            f"Checkpoint inicializado hasta {completed_end}. "
+            "No se descargaron datos."
+        )
+        print(
+            "La próxima ejecución de 'sync' comenzará automáticamente "
+            f"en {completed_end + timedelta(days=1)}."
+        )
+        return
+
+    state = load_sync_state()
+    last_complete_date = (
+        date.fromisoformat(str(state["last_complete_date"])) if state else None
+    )
+    period = resolve_sync_period(
+        last_complete_date=last_complete_date,
+        completed_end=completed_end,
+        initial_days=initial_days,
+    )
+    if period is None:
+        print(
+            f"No hay días completos nuevos. El checkpoint ya está en "
+            f"{last_complete_date}."
+        )
+        return
+
+    sync_start, sync_end = period
+    print(f"Sincronización incremental: {sync_start} a {sync_end}.")
+    summary = download(
+        days=initial_days,
+        start=sync_start,
+        end=sync_end,
+        output_root=output_root,
+        only=None,
+    )
+
+    failed = [
+        endpoint
+        for endpoint, result in summary["endpoints"].items()
+        if result.get("status") != "ok"
+    ]
+    if failed:
+        raise RuntimeError(
+            "El checkpoint no avanzó porque fallaron estos endpoints: "
+            + ", ".join(failed)
+            + ". Podés volver a ejecutar sync sin perder días."
+        )
+
+    save_sync_state(
+        last_complete_date=sync_end,
+        destination=str(summary["destination"]),
+        source="incremental_sync",
+    )
+    print(f"Checkpoint actualizado hasta {sync_end}.")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -516,6 +683,34 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="+",
         help="Descargar solamente los endpoints indicados.",
     )
+
+    sync_parser = subparsers.add_parser(
+        "sync",
+        help="Descargar solamente los días completos posteriores al checkpoint.",
+    )
+    sync_parser.add_argument(
+        "--initial-days",
+        type=int,
+        default=30,
+        help=(
+            "Días de la descarga base si todavía no existe un checkpoint "
+            "(predeterminado: 30)."
+        ),
+    )
+    sync_parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path("exports"),
+        help="Carpeta base de las exportaciones (predeterminado: exports).",
+    )
+    sync_parser.add_argument(
+        "--initialize-from-existing",
+        action="store_true",
+        help=(
+            "Crear el checkpoint en el último día completo sin descargar; "
+            "usar solamente si ya existe una exportación histórica."
+        ),
+    )
     return parser
 
 
@@ -525,13 +720,19 @@ def main() -> int:
     try:
         if args.command == "auth":
             authorize()
-        else:
+        elif args.command == "download":
             download(
                 days=args.days,
                 start=args.start,
                 end=args.end,
                 output_root=args.output,
                 only=args.only,
+            )
+        else:
+            sync(
+                initial_days=args.initial_days,
+                output_root=args.output,
+                initialize_from_existing=args.initialize_from_existing,
             )
         return 0
     except (RuntimeError, ValueError, socket.error) as exc:
